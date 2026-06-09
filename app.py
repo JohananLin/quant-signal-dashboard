@@ -3,10 +3,21 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import joblib
+from strategies.feature_engineering import create_features, FEATURE_COLS
 
-from utils.data import get_hist_data_baostock
+from utils.data import get_hist_data
 from strategies.ma_cross import calculate_ma_signals, get_latest_signal
 from strategies.momentum import get_latest_rotation_signal
+
+# ===== 新增：缓存加载ML模型 =====
+@st.cache_resource
+def load_ml_model():
+    try:
+        data = joblib.load('ml_model.pkl')
+        return data['model'], data['features']
+    except Exception as e:
+        return None, None
 
 # ---------- 页面设置 ----------
 st.set_page_config(page_title="量化信号看板", page_icon="📈", layout="wide")
@@ -29,15 +40,18 @@ st.markdown("---")
 st.sidebar.header("⚙️ 控制面板")
 strategy_choice = st.sidebar.selectbox(
     "选择策略",
-    ["双均线策略 (MA Cross)", "动量轮动策略 (Momentum Rotation)"]
+    ["双均线策略 (MA Cross)", "动量轮动策略 (Momentum Rotation)", "机器学习预测 (ML)"]
 )
 
-if strategy_choice.startswith("双均线"):
-    stock_code = st.sidebar.text_input("股票代码 (baostock格式)", value="sz.000001")
+if strategy_choice != "动量轮动策略 (Momentum Rotation)":
+    stock_code = st.sidebar.text_input(
+        "股票代码 (baostock格式)",
+        value="sz.000001",
+        help="例如：sz.000001（平安银行）、sh.600519（贵州茅台）"
+    )
 else:
     stock_code = None
     st.sidebar.info("默认股票池：平安银行、万科A、贵州茅台、宁德时代、中国平安")
-
 st.sidebar.markdown("---")
 st.sidebar.info("数据来源：baostock | 建议每5分钟手动刷新")
 refresh_btn = st.sidebar.button("🔄 刷新数据")
@@ -65,7 +79,7 @@ with tab1:
         # ===== 双均线 =====
         if strategy_choice.startswith("双均线"):
             with st.spinner("获取数据..."):
-                df = get_hist_data_baostock(stock_code, start_date, end_date)
+                df = get_hist_data(stock_code, start_date, end_date)
             if df is not None and len(df) > 30:
                 df_signal = calculate_ma_signals(df, 5, 20)
                 signal_text, position_text = get_latest_signal(df_signal)
@@ -107,13 +121,13 @@ with tab1:
                 st.error(f"❌ 无法获取 {stock_code} 的数据")
         
         # ===== 动量轮动 =====
-        else:
+        elif strategy_choice.startswith("动量轮动"):
             stocks = {"平安银行":"sz.000001","万科A":"sz.000002","贵州茅台":"sh.600519",
                       "宁德时代":"sz.300750","中国平安":"sh.601318"}
             with st.spinner("获取多只股票数据..."):
                 all_data = {}
                 for name, code in stocks.items():
-                    df = get_hist_data_baostock(code, start_date, end_date)
+                    df = get_hist_data(code, start_date, end_date)
                     if df is not None:
                         all_data[name] = df
             if len(all_data) < 3:
@@ -142,8 +156,71 @@ with tab1:
                 rank_df['动量值'] = rank_df['动量值'].apply(lambda x: f"{x:.2%}")
                 rank_df['持仓'] = rank_df['股票'].apply(lambda x: '✅' if x in result['holdings'] else '')
                 detail_placeholder.dataframe(rank_df, use_container_width=True, hide_index=True)
+        
+        # ----- 机器学习预测 -----
+        elif strategy_choice == "机器学习预测 (ML)":
+            # ===== 新增 ML 预测分支 =====
+            model, feat_cols = load_ml_model()
+            if model is None:
+                st.error("❌ 模型文件 ml_model.pkl 未找到，请先训练并保存。")
+            else:
+                with st.spinner("获取数据并计算特征..."):
+                    df = get_hist_data(stock_code, start_date, end_date)
+                if df is not None and len(df) > 60:
+                    df_feat = create_features(df)
+                    if len(df_feat) == 0:
+                        st.error("❌ 特征计算后无有效数据，请增加历史数据时间范围。")
+                    else:
+                        latest = df_feat.iloc[-1:]
+                        prob_up = model.predict_proba(latest[feat_cols])[0][1]
+                        pred_label = "🟢 预测上涨" if prob_up >= 0.5 else "🔴 预测下跌"
+                        
+                        metric_position.metric("ML 预测信号", pred_label)
+                        metric_signal.metric("上涨概率", f"{prob_up:.2%}")
+                        price_latest = latest['close'].values[0]
+                        metric_price.metric("最新收盘价", f"¥{price_latest:.2f}")
+                        
+                        # 生成历史预测信号用于图表
+                        all_prob = model.predict_proba(df_feat[feat_cols])[:, 1]
+                        df_feat['pred_prob'] = all_prob
+                        df_feat['pred_dir'] = (df_feat['pred_prob'] >= 0.5).astype(int)
+                        
+                        plot_ml = df_feat.iloc[-100:]
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=plot_ml.index, y=plot_ml['close'],
+                            mode='lines', name='收盘价', line=dict(color='black')
+                        ))
+                        buy_points = plot_ml[plot_ml['pred_dir'] == 1]
+                        fig.add_trace(go.Scatter(
+                            x=buy_points.index, y=buy_points['close'] * 0.99,
+                            mode='markers', marker=dict(symbol='triangle-up', size=8, color='red'),
+                            name='预测上涨'
+                        ))
+                        sell_points = plot_ml[plot_ml['pred_dir'] == 0]
+                        fig.add_trace(go.Scatter(
+                            x=sell_points.index, y=sell_points['close'] * 1.01,
+                            mode='markers', marker=dict(symbol='triangle-down', size=8, color='green'),
+                            name='预测下跌'
+                        ))
+                        fig.update_layout(title=f"{stock_code} - ML预测信号 (最近100天)",
+                                          xaxis_title="日期", yaxis_title="价格",
+                                          height=500, template='plotly_white')
+                        chart_placeholder.plotly_chart(fig, use_container_width=True)
+                        
+                        detail_placeholder.markdown("#### 📋 近期预测 vs 实际")
+                        recent = df_feat[['close', 'pred_dir', 'target_dir']].tail(10)
+                        recent['预测'] = recent['pred_dir'].map({1: '🟢涨', 0: '🔴跌'})
+                        recent['实际'] = recent['target_dir'].map({1: '🟢涨', 0: '🔴跌'})
+                        recent['日期'] = recent.index.strftime('%Y-%m-%d')
+                        detail_placeholder.dataframe(
+                            recent[['日期', 'close', '预测', '实际']],
+                            use_container_width=True, hide_index=True
+                        )
+                else:
+                    st.error("❌ 数据不足，需要至少60个交易日。")
     else:
-        chart_placeholder.info("👈 请点击侧边栏「刷新数据」按钮加载图表")
+        	     chart_placeholder.info("👈 请点击侧边栏「刷新数据」按钮加载图表")
 
 with tab2:
     st.subheader("策略表现对比（示例数据）")

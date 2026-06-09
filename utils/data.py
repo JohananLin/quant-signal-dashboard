@@ -76,3 +76,47 @@ def get_realtime_akshare(code):
     except Exception as e:
         print(f"⚠️ 获取实时行情失败: {e}")
     return None
+import akshare as ak
+
+def get_hist_data_akshare(symbol, start_date, end_date, adjust="qfq"):
+    """
+    从 akshare 获取 A 股历史日线数据（前复权），作为备用数据源。
+    symbol: 纯数字代码，如 '000001'
+    start_date/end_date: 'YYYY-MM-DD' 格式
+    """
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
+            start_date=start_date.replace('-', ''),
+            end_date=end_date.replace('-', ''),
+            adjust=adjust
+        )
+        df.rename(columns={
+            '日期': 'date', '开盘': 'open', '收盘': 'close',
+            '最高': 'high', '最低': 'low', '成交量': 'volume'
+        }, inplace=True)
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        df.sort_index(inplace=True)
+        return df
+    except Exception as e:
+        print(f"akshare 获取失败: {e}")
+        return None
+
+def get_hist_data(code, start_date, end_date):
+    """
+    统一数据接口：先尝试 baostock，失败则用 akshare。
+    code 格式：'sz.000001' 或 'sh.600519'
+    """
+    # 先尝试 baostock
+    try:
+        df = get_hist_data_baostock(code, start_date, end_date)
+        if df is not None and len(df) > 0:
+            return df
+    except Exception as e:
+        print(f"baostock 获取失败，切换到 akshare: {e}")
+    
+    # 回退到 akshare
+    symbol = code.split('.')[1]  # 从 'sz.000001' 提取 '000001'
+    return get_hist_data_akshare(symbol, start_date, end_date)
