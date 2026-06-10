@@ -9,6 +9,7 @@ from strategies.feature_engineering import create_features, FEATURE_COLS
 from utils.data import get_hist_data
 from strategies.ma_cross import calculate_ma_signals, get_latest_signal
 from strategies.momentum import get_latest_rotation_signal
+from strategies.backtest import compute_backtest
 
 # ===== 新增：缓存加载ML模型 =====
 @st.cache_resource
@@ -62,7 +63,7 @@ if 'data_loaded' not in st.session_state:
     st.session_state['data_loaded'] = False
 
 # ---------- Tab 页面结构 ----------
-tab1, tab2, tab3 = st.tabs(["📊 当前信号", "📈 策略对比", "ℹ️ 关于"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 当前信号", "📈 策略对比", "📊 回测分析", "ℹ️ 关于"])
 
 with tab1:
     col1, col2, col3 = st.columns(3)
@@ -234,6 +235,73 @@ with tab2:
     st.markdown("> 以上数据为示意，真实绩效需结合回测引擎（可在后续扩展中接入Day 4的回测代码）")
 
 with tab3:
+    st.subheader("📈 ML 策略回测分析")
+    st.markdown("基于机器学习预测信号的历史表现（含双边手续费0.1%+滑点0.1%）。")
+    
+    if st.session_state.get('data_loaded') and strategy_choice == "机器学习预测 (ML)":
+        # 获取与当前 ML 分支相同的数据和特征
+        with st.spinner("正在运行回测..."):
+            # 重新获取数据（与 ML 分支保持一致）
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+            df = get_hist_data(stock_code, start_date, end_date)
+            if df is not None and len(df) > 60:
+                model, feat_cols = load_ml_model()
+                if model is not None:
+                    df_feat = create_features(df)
+                    if len(df_feat) > 0:
+                        # 生成全历史预测信号
+                        all_prob = model.predict_proba(df_feat[feat_cols])[:, 1]
+                        df_feat['pred_dir'] = (all_prob >= 0.5).astype(int)
+                        
+                        # 运行回测
+                        bt_result = compute_backtest(df_feat, signal_col='pred_dir', 
+                                                    initial_capital=100000,
+                                                    commission_rate=0.001, slippage=0.001)
+                        
+                        # 显示核心指标
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("累计收益率", f"{bt_result['total_return']:.2%}")
+                        col2.metric("年化收益率", f"{bt_result['annual_return']:.2%}")
+                        col3.metric("夏普比率", f"{bt_result['sharpe_ratio']:.2f}")
+                        col4.metric("最大回撤", f"{bt_result['max_drawdown']:.2%}")
+                        
+                        col5, col6 = st.columns(2)
+                        col5.metric("年化波动率", f"{bt_result['annual_volatility']:.2%}")
+                        col6.metric("胜率", f"{bt_result['win_rate']:.2%}")
+                        
+                        # 净值曲线
+                        st.markdown("#### 策略净值 vs 基准")
+                        # 计算基准净值（买入持有）
+                        bh_nav = (1 + df_feat['close'].pct_change()).cumprod() * 100000
+                        # 合并两个净值序列
+                        compare_df = pd.DataFrame({
+                            '策略净值': bt_result['nav'],
+                            '买入持有': bh_nav
+                        }).dropna()
+                        st.line_chart(compare_df)
+                        
+                        # 回撤曲线
+                        st.markdown("#### 回撤曲线")
+                        cummax = bt_result['nav'].cummax()
+                        drawdown = (bt_result['nav'] / cummax - 1) * 100
+                        st.area_chart(drawdown.rename('回撤 %'))
+                        
+                        # 月度收益表（可选）
+                        monthly_ret = bt_result['nav'].resample('M').last().pct_change().dropna()
+                        if not monthly_ret.empty:
+                            st.markdown("#### 月度收益率")
+                            monthly_ret.index = monthly_ret.index.strftime('%Y-%m')
+                            st.bar_chart(monthly_ret)
+                    else:
+                        st.warning("特征计算后无有效数据，请扩展历史数据范围。")
+                else:
+                    st.warning("模型文件未找到，请先训练模型。")
+            else:
+                st.warning("数据不足，无法回测。")
+    else:
+        st.info("👈 请先在「当前信号」页面选择「机器学习预测」策略并加载数据，然后回到此页面查看回测。")
+with tab4:
     st.markdown("""
     ### 📖 使用说明
     - **双均线策略**：当 MA5 上穿 MA20 时产生买入信号，下穿时卖出。
